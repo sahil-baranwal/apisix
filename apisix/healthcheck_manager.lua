@@ -168,10 +168,6 @@ end
 function _M.fetch_checker(resource_path, resource_ver)
     local working_item = working_pool[resource_path]
     if working_item and working_item.version == resource_ver then
-        if working_item.checker._retired then
-            core.log.error("ATOMIC_PROBE VIOLATION fetch_checker returned RETIRED checker for ",
-                           resource_path)
-        end
         return working_item.checker
     end
 
@@ -292,7 +288,6 @@ local function reconcile_resource(resource_path)
     local old = item
     add_working_pool(resource_path, new_version, checker, upstream, targets_map)
     if old then
-        old.checker._retired = true
         old.checker:delayed_clear(DELAYED_CLEAR_TIMEOUT)
         old.checker:stop()
     end
