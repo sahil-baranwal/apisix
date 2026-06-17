@@ -45,64 +45,6 @@ end
 _M.get_healthchecker_name = get_healthchecker_name
 
 
-local function is_ip(host)
-    return core.utils.parse_ipv4(host) or core.utils.parse_ipv6(host)
-end
-
-
--- A health checker must only be managed once the upstream nodes have been
--- resolved to concrete IPs, because that is exactly what the balancer queries
--- the checker with (see balancer.lua `fetch_health_nodes`). If we built or
--- diffed targets from an unresolved snapshot (domain hosts, e.g. right after a
--- config reload or service discovery update), the domain-form and resolved-IP
--- form of the same node would be treated as different targets, causing health
--- state to be wiped on every flip between the two. Skip until fully resolved.
-local function nodes_resolved(up_conf)
-    if not up_conf.nodes then
-        return false
-    end
-    for _, node in ipairs(up_conf.nodes) do
-        if not is_ip(node.host) then
-            return false
-        end
-    end
-    return true
-end
-
-
--- Compute the list of healthcheck targets for an upstream config.
--- Returns the ordered target list together with a lookup map keyed by
--- "ip:port:hostname" so that callers can diff two node sets cheaply.
--- The hostname is resolved here (host or node.host) exactly as the
--- healthcheck library would default it, so the same key can be used for
--- both add_target and remove_target.
-local function build_targets(up_conf)
-    local targets = {}
-    local targets_map = {}
-    local active = up_conf.checks and up_conf.checks.active
-    local host = active and active.host
-    local port = active and active.port
-    local up_hdr = up_conf.pass_host == "rewrite" and up_conf.upstream_host
-    local use_node_hdr = up_conf.pass_host == "node" or nil
-
-    for _, node in ipairs(up_conf.nodes) do
-        local host_hdr = up_hdr or (use_node_hdr and node.domain)
-        local t_port = port or node.port
-        local hostname = host or node.host
-        local target = {
-            ip = node.host,
-            port = t_port,
-            hostname = hostname,
-            hostheader = host_hdr,
-        }
-        targets[#targets + 1] = target
-        targets_map[node.host .. ":" .. tostring(t_port) .. ":" .. tostring(hostname)] = target
-    end
-
-    return targets, targets_map
-end
-
-
 local function create_checker(up_conf)
     if not up_conf.checks then
         return nil
@@ -130,14 +72,27 @@ local function create_checker(up_conf)
     end
 
     -- Add target nodes
-    local targets, targets_map = build_targets(up_conf)
-    for _, target in ipairs(targets) do
-        local ok, err = checker:add_target(target.ip, target.port, target.hostname,
-                                        true, target.hostheader)
+    local targets_map = {}
+    local active = up_conf.checks and up_conf.checks.active
+    local host = active and active.host
+    local port = active and active.port
+    local up_hdr = up_conf.pass_host == "rewrite" and up_conf.upstream_host
+    local use_node_hdr = up_conf.pass_host == "node" or nil
+
+    for _, node in ipairs(up_conf.nodes) do
+        local host_hdr = up_hdr or (use_node_hdr and node.domain)
+        local t_port = port or node.port
+        local hostname = host or node.host
+        local ok, err = checker:add_target(node.host, t_port, hostname, true, host_hdr)
         if not ok then
-            core.log.error("failed to add healthcheck target: ", target.ip, ":",
-                          target.port, " err: ", err)
+            core.log.error("failed to add healthcheck target: ", node.host, ":",
+                          t_port, " err: ", err)
         end
+        targets_map[node.host .. ":" .. tostring(t_port) .. ":" .. tostring(hostname)] = {
+            ip = node.host,
+            port = t_port,
+            hostname = hostname,
+        }
     end
 
     return checker, targets_map
@@ -149,14 +104,26 @@ end
 -- add_target is a no-op for targets that already exist; only genuinely new
 -- nodes are added (as healthy) and removed nodes are deleted from the checker.
 local function update_checker_targets(checker, up_conf, old_targets_map)
-    local _, new_targets_map = build_targets(up_conf)
+    local new_targets_map = {}
+    local active = up_conf.checks and up_conf.checks.active
+    local host = active and active.host
+    local port = active and active.port
+    local up_hdr = up_conf.pass_host == "rewrite" and up_conf.upstream_host
+    local use_node_hdr = up_conf.pass_host == "node" or nil
 
-    for _, target in pairs(new_targets_map) do
-        local ok, err = checker:add_target(target.ip, target.port, target.hostname,
-                                        true, target.hostheader)
+    for _, node in ipairs(up_conf.nodes) do
+        local host_hdr = up_hdr or (use_node_hdr and node.domain)
+        local t_port = port or node.port
+        local hostname = host or node.host
+        new_targets_map[node.host .. ":" .. tostring(t_port) .. ":" .. tostring(hostname)] = {
+            ip = node.host,
+            port = t_port,
+            hostname = hostname,
+        }
+        local ok, err = checker:add_target(node.host, t_port, hostname, true, host_hdr)
         if not ok then
-            core.log.error("failed to add healthcheck target: ", target.ip, ":",
-                          target.port, " err: ", err)
+            core.log.error("failed to add healthcheck target: ", node.host, ":",
+                          t_port, " err: ", err)
         end
     end
 
@@ -201,6 +168,10 @@ end
 function _M.fetch_checker(resource_path, resource_ver)
     local working_item = working_pool[resource_path]
     if working_item and working_item.version == resource_ver then
+        if working_item.checker._retired then
+            core.log.error("ATOMIC_PROBE VIOLATION fetch_checker returned RETIRED checker for ",
+                           resource_path)
+        end
         return working_item.checker
     end
 
@@ -263,145 +234,108 @@ local function resolve_upstream(resource_path, res_conf)
 end
 
 
--- Bring the checker for a resource in line with the requested upstream config.
--- When the checks configuration is unchanged we only diff the target nodes so
--- that existing health status survives node scaling / discovery updates. A
--- full rebuild only happens when the checks block itself changes.
-local function reconcile_checker(resource_path, up_conf, new_version)
-    -- Only act on a fully-resolved upstream so target identities stay stable
-    -- and match what the balancer queries. An existing checker is left
-    -- untouched (its health state preserved) until the nodes resolve again.
-    if not nodes_resolved(up_conf) then
-        core.log.info("skip reconcile, upstream not fully resolved: ", resource_path)
-        return
-    end
+-- Reconcile a single resource's checker against the latest config. Safe to call
+-- from a single timer that sweeps both the waiting and working pools.
+--
+-- Always reconcile against the latest known version (not the version requested
+-- when the resource was queued); this avoids a race where the queued version is
+-- already stale and the checker would otherwise never be (re)created.
+--
+-- create_checker() yields (it broadcasts target events over a cosocket), so the
+-- checker is built BEFORE the old one is torn down and swapped in atomically.
+-- This keeps working_pool[resource_path] pointing at a live checker across the
+-- yield, so a concurrent fetch_checker() (request path) never observes a checker
+-- that has already been stopped, and a failed build leaves the old one intact.
+local function reconcile_resource(resource_path)
+    local res_conf = resource.fetch_latest_conf(resource_path)
+    local upstream = resolve_upstream(resource_path, res_conf)
 
     local item = working_pool[resource_path]
-    if item and item.version == new_version then
-        return
-    end
 
-    if item and checks_config_equal(item, up_conf) then
-        local new_targets_map = update_checker_targets(item.checker, up_conf,
-                                                        item.targets_map)
-        item.version = new_version
-        item.targets_map = new_targets_map
-        core.log.info("incrementally updated checker targets: ", tostring(item.checker),
-                      " for resource: ", resource_path, " and version: ", new_version)
-        return
-    end
-
-    if item then
-        -- checks configuration changed: rebuild the checker from scratch
-        item.checker:delayed_clear(DELAYED_CLEAR_TIMEOUT)
-        item.checker:stop()
-        core.log.info("releasing existing checker: ", tostring(item.checker),
-                      " for resource: ", resource_path,
-                      " due to checks configuration change")
-    end
-
-    local checker, targets_map = create_checker(up_conf)
-    if not checker then
-        return
-    end
-    core.log.info("create new checker: ", tostring(checker), " for resource: ",
-                resource_path, " and version: ", new_version)
-    add_working_pool(resource_path, new_version, checker, up_conf, targets_map)
-end
-
-
-local function timer_create_checker()
-    if core.table.nkeys(waiting_pool) == 0 then
-        return
-    end
-
-    local waiting_snapshot = tab_clone(waiting_pool)
-    for resource_path in pairs(waiting_snapshot) do
-        do
-            local res_conf = resource.fetch_latest_conf(resource_path)
-            local upstream = resolve_upstream(resource_path, res_conf)
-            if not upstream then
-                goto continue
-            end
-            -- always reconcile against the latest known version instead of the
-            -- version that was requested when the resource was queued; this
-            -- avoids a race where the queued version is already stale and the
-            -- checker would otherwise never be (re)created.
-            local new_version = upstream_utils.version(res_conf.modifiedIndex,
-                                                             upstream._nodes_ver)
-            core.log.info("checking waiting pool for resource: ", resource_path,
-                    " current version: ", new_version)
-            reconcile_checker(resource_path, upstream, new_version)
-        end
-
-        ::continue::
-        waiting_pool[resource_path] = nil
-    end
-end
-
-
-local function timer_working_pool_check()
-    if core.table.nkeys(working_pool) == 0 then
-        return
-    end
-
-    local working_snapshot = tab_clone(working_pool)
-    for resource_path, item in pairs(working_snapshot) do
-        local res_conf = resource.fetch_latest_conf(resource_path)
-        local upstream = resolve_upstream(resource_path, res_conf)
-
-        if not upstream then
-            --- resource doesn't exist anymore, destroy the checker
+    if not upstream then
+        -- resource doesn't exist anymore, destroy the checker if we have one
+        if item then
             working_pool[resource_path] = nil
             item.checker.dead = true
             item.checker:delayed_clear(DELAYED_CLEAR_TIMEOUT)
             item.checker:stop()
-            core.log.info("try to release checker: ", tostring(item.checker), " for resource: ",
+            core.log.info("released checker: ", tostring(item.checker), " for resource: ",
                         resource_path, " and version : ", item.version)
-        else
-            local current_ver = upstream_utils.version(res_conf.modifiedIndex,
-                                                    upstream._nodes_ver)
-            core.log.info("checking working pool for resource: ", resource_path,
-                        " current version: ", current_ver, " item version: ", item.version)
-            if item.version ~= current_ver then
-                --- nodes and/or checks changed, reconcile without losing
-                --- health state where possible
-                reconcile_checker(resource_path, upstream, current_ver)
-            end
+        end
+        return
+    end
+
+    local new_version = upstream_utils.version(res_conf.modifiedIndex,
+                                               upstream._nodes_ver)
+    core.log.info("reconciling resource: ", resource_path,
+                " current version: ", new_version,
+                " item version: ", item and item.version or "nil")
+
+    if item and item.version == new_version then
+        return
+    end
+
+    if item and checks_config_equal(item, upstream) then
+        -- only nodes changed: reconcile targets on the live checker in place
+        item.targets_map = update_checker_targets(item.checker, upstream,
+                                                  item.targets_map)
+        item.version = new_version
+        return
+    end
+
+    -- structural change (or first creation): build new, swap, then retire old
+    local checker, targets_map = create_checker(upstream)
+    if not checker then
+        -- build failed; keep the old checker (if any) running
+        return
+    end
+    local old = item
+    add_working_pool(resource_path, new_version, checker, upstream, targets_map)
+    if old then
+        old.checker._retired = true
+        old.checker:delayed_clear(DELAYED_CLEAR_TIMEOUT)
+        old.checker:stop()
+    end
+end
+
+
+-- Single reconcile timer for both pools. Running both sweeps in one timer (with
+-- a single re-entry guard) means the two sweeps can never interleave on the same
+-- resource across create_checker()'s yield, which would otherwise let two timers
+-- each build a checker and leak the loser.
+local function timer_reconcile()
+    if core.table.nkeys(waiting_pool) > 0 then
+        local waiting_snapshot = tab_clone(waiting_pool)
+        for resource_path in pairs(waiting_snapshot) do
+            reconcile_resource(resource_path)
+            waiting_pool[resource_path] = nil
+        end
+    end
+
+    if core.table.nkeys(working_pool) > 0 then
+        local working_snapshot = tab_clone(working_pool)
+        for resource_path in pairs(working_snapshot) do
+            reconcile_resource(resource_path)
         end
     end
 end
 
 function _M.init_worker()
-    local timer_create_checker_running = false
-    local timer_working_pool_check_running = false
+    local timer_reconcile_running = false
     timer_every(1, function ()
-        if not exiting() then
-            if timer_create_checker_running then
-                core.log.warn("timer_create_checker is already running, skipping this iteration")
-                return
-            end
-            timer_create_checker_running = true
-            local ok, err = pcall(timer_create_checker)
-            if not ok then
-                core.log.error("failed to run timer_create_checker: ", err)
-            end
-            timer_create_checker_running = false
+        if exiting() then
+            return
         end
-    end)
-    timer_every(1, function ()
-        if not exiting() then
-            if timer_working_pool_check_running then
-                core.log.warn("timer_working_pool_check is already running skipping iteration")
-                return
-            end
-            timer_working_pool_check_running = true
-            local ok, err = pcall(timer_working_pool_check)
-            if not ok then
-                core.log.error("failed to run timer_working_pool_check: ", err)
-            end
-            timer_working_pool_check_running = false
+        if timer_reconcile_running then
+            core.log.warn("timer_reconcile is already running, skipping this iteration")
+            return
         end
+        timer_reconcile_running = true
+        local ok, err = pcall(timer_reconcile)
+        if not ok then
+            core.log.error("failed to run timer_reconcile: ", err)
+        end
+        timer_reconcile_running = false
     end)
 end
 
