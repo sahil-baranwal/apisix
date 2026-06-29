@@ -97,7 +97,7 @@ local function update_checker(checker, name, new_targets)
 
     for key, t in pairs(old_keys) do
         if not new_keys[key] then
-            local ok, err = checker:remove_target(t.ip, t.port, t.hostname)
+            local ok, err = checker:remove_target(t.ip, t.port, t.hostname or t.host)
             if not ok then
                 core.log.error("failed to remove healthcheck target: ", t.ip, ":",
                                t.port, " err: ", err)
