@@ -31,8 +31,7 @@ local jp = require("jsonpath")
 local config_util = require("apisix.core.config_util")
 
 local _M = {}
-local working_pool = {}     -- resource_path -> {version, checker, checks,
-                            --                   pass_host, upstream_host, targets_map}
+local working_pool = {}     -- resource_path -> {version = ver, checker = checker, checks = checks}
 local waiting_pool = {}      -- resource_path -> resource_ver
 
 local DELAYED_CLEAR_TIMEOUT = 10
@@ -43,6 +42,80 @@ local function get_healthchecker_name(value)
     return "upstream#" .. (value.resource_key or value.upstream.resource_key)
 end
 _M.get_healthchecker_name = get_healthchecker_name
+
+
+local function build_targets(up_conf)
+    local host = up_conf.checks and up_conf.checks.active and up_conf.checks.active.host
+    local port = up_conf.checks and up_conf.checks.active and up_conf.checks.active.port
+    local up_hdr = up_conf.pass_host == "rewrite" and up_conf.upstream_host
+    local use_node_hdr = up_conf.pass_host == "node" or nil
+
+    local targets = {}
+    for _, node in ipairs(up_conf.nodes) do
+        local host_hdr = up_hdr or (use_node_hdr and node.domain)
+        targets[#targets + 1] = {
+            host = node.host,
+            port = port or node.port,
+            hostname = host,
+            host_hdr = host_hdr,
+        }
+    end
+
+    return targets
+end
+
+
+local function build_target_key(t)
+    -- handles both freshly built targets (host/host_hdr) and the resolved targets
+    -- returned by get_target_list (ip/hostheader); resty defaults hostname to ip.
+    local host = t.host or t.ip
+    return host .. ":" .. tostring(t.port) .. ":" ..
+           (t.hostname or host) .. ":" .. tostring(t.host_hdr or t.hostheader or "")
+end
+
+
+local function update_checker(checker, name, new_targets)
+    if not healthcheck then
+        healthcheck = require("resty.healthcheck")
+    end
+
+    local old_targets, err = healthcheck.get_target_list(name, healthcheck_shdict_name)
+    if not old_targets then
+        core.log.error("failed to get target list for ", name, " err: ", err)
+        old_targets = {}
+    end
+
+    local old_keys = {}
+    for _, t in ipairs(old_targets) do
+        old_keys[build_target_key(t)] = t
+    end
+
+    local new_keys = {}
+    for _, t in ipairs(new_targets) do
+        new_keys[build_target_key(t)] = true
+    end
+
+    for key, t in pairs(old_keys) do
+        if not new_keys[key] then
+            local ok, err = checker:remove_target(t.ip, t.port, t.hostname)
+            if not ok then
+                core.log.error("failed to remove healthcheck target: ", t.ip, ":",
+                               t.port, " err: ", err)
+            end
+        end
+    end
+
+    for _, t in ipairs(new_targets) do
+        if not old_keys[build_target_key(t)] then
+            local ok, err = checker:add_target(t.host, t.port, t.hostname,
+                                               true, t.host_hdr)
+            if not ok then
+                core.log.error("failed to add healthcheck target: ", t.host, ":",
+                               t.port, " err: ", err)
+            end
+        end
+    end
+end
 
 
 local function create_checker(up_conf)
@@ -72,96 +145,17 @@ local function create_checker(up_conf)
     end
 
     -- Add target nodes
-    local targets_map = {}
-    local active = up_conf.checks and up_conf.checks.active
-    local host = active and active.host
-    local port = active and active.port
-    local up_hdr = up_conf.pass_host == "rewrite" and up_conf.upstream_host
-    local use_node_hdr = up_conf.pass_host == "node" or nil
-
-    for _, node in ipairs(up_conf.nodes) do
-        local host_hdr = up_hdr or (use_node_hdr and node.domain)
-        local t_port = port or node.port
-        local hostname = host or node.host
-        local ok, err = checker:add_target(node.host, t_port, hostname, true, host_hdr)
+    local targets = build_targets(up_conf)
+    for _, target in ipairs(targets) do
+        local ok, err = checker:add_target(target.host, target.port, target.hostname,
+                                        true, target.host_hdr)
         if not ok then
-            core.log.error("failed to add healthcheck target: ", node.host, ":",
-                          t_port, " err: ", err)
-        end
-        targets_map[node.host .. ":" .. tostring(t_port) .. ":" .. tostring(hostname)] = {
-            ip = node.host,
-            port = t_port,
-            hostname = hostname,
-        }
-    end
-
-    return checker, targets_map
-end
-
-
--- Reconcile a live checker's targets with the current upstream nodes without
--- destroying the checker. Existing targets keep their health status because
--- add_target is a no-op for targets that already exist; only genuinely new
--- nodes are added (as healthy) and removed nodes are deleted from the checker.
-local function update_checker_targets(checker, up_conf, old_targets_map)
-    local new_targets_map = {}
-    local active = up_conf.checks and up_conf.checks.active
-    local host = active and active.host
-    local port = active and active.port
-    local up_hdr = up_conf.pass_host == "rewrite" and up_conf.upstream_host
-    local use_node_hdr = up_conf.pass_host == "node" or nil
-
-    for _, node in ipairs(up_conf.nodes) do
-        local host_hdr = up_hdr or (use_node_hdr and node.domain)
-        local t_port = port or node.port
-        local hostname = host or node.host
-        new_targets_map[node.host .. ":" .. tostring(t_port) .. ":" .. tostring(hostname)] = {
-            ip = node.host,
-            port = t_port,
-            hostname = hostname,
-        }
-        local ok, err = checker:add_target(node.host, t_port, hostname, true, host_hdr)
-        if not ok then
-            core.log.error("failed to add healthcheck target: ", node.host, ":",
-                          t_port, " err: ", err)
+            core.log.error("failed to add healthcheck target: ", target.host, ":",
+                          target.port, " err: ", err)
         end
     end
 
-    for key, target in pairs(old_targets_map) do
-        if not new_targets_map[key] then
-            local ok, err = checker:remove_target(target.ip, target.port, target.hostname)
-            if not ok then
-                core.log.error("failed to remove healthcheck target: ", target.ip, ":",
-                              target.port, " err: ", err)
-            else
-                core.log.info("removed healthcheck target: ", target.ip, ":", target.port)
-            end
-        end
-    end
-
-    return new_targets_map
-end
-
-
--- A change is only structural (requires rebuilding the checker) when the
--- checks block itself or the host-header shaping changes. Node additions and
--- removals are handled incrementally so health status is preserved.
-local function checks_config_equal(item, up_conf)
-    return core.table.deep_eq(item.checks, up_conf.checks)
-       and item.pass_host == up_conf.pass_host
-       and item.upstream_host == up_conf.upstream_host
-end
-
-
-local function add_working_pool(resource_path, resource_ver, checker, up_conf, targets_map)
-    working_pool[resource_path] = {
-        version = resource_ver,
-        checker = checker,
-        checks = up_conf.checks,
-        pass_host = up_conf.pass_host,
-        upstream_host = up_conf.upstream_host,
-        targets_map = targets_map,
-    }
+    return checker, targets
 end
 
 
@@ -188,7 +182,43 @@ function _M.fetch_node_status(checker, ip, port, hostname)
         return true
     end
 
-    return checker:get_target_status(ip, port, hostname)
+    local ok, err = checker:get_target_status(ip, port, hostname)
+    if err == "target not found" then
+        -- get_target_status reads a worker-local cache that resty.healthcheck fills
+        -- asynchronously (add_target only raises an event), so right after a checker
+        -- is created a target can be missing from this worker's view even though it
+        -- is registered in the shm and being probed. Treat it as unknown (usable)
+        -- rather than unhealthy, but still log it: a target that stays missing means
+        -- the cache never converged, a real bug worth surfacing rather than swallowing.
+        core.log.warn("health check target status not available yet, treat as unknown",
+                      ", addr: ", ip, ":", port, ", host: ", hostname)
+        return true
+    end
+
+    return ok, err
+end
+
+
+local function add_working_pool(resource_path, resource_ver, checker, checks)
+    working_pool[resource_path] = {
+        version = resource_ver,
+        checker = checker,
+        checks  = checks,
+    }
+end
+
+local function find_in_working_pool(resource_path, resource_ver)
+    local checker = working_pool[resource_path]
+    if not checker then
+        return nil  -- not found
+    end
+
+    if checker.version ~= resource_ver then
+        core.log.info("version mismatch for resource: ", resource_path,
+                    " current version: ", checker.version, " requested version: ", resource_ver)
+        return nil  -- version not match
+    end
+    return checker
 end
 
 
@@ -201,136 +231,156 @@ local function get_plugin_name(path)
         or json_path:match("^plugins%.([^%.]+)")
 end
 
-
--- Resolve the upstream config (and its resource_key) from a fetched resource
--- config, transparently handling plugin-provided dynamic upstreams.
--- Returns nil when the resource no longer exists or has no value.
-local function resolve_upstream(resource_path, res_conf)
-    if not (res_conf and res_conf.value) then
-        return nil
+local function timer_create_checker()
+    if core.table.nkeys(waiting_pool) == 0 then
+        return
     end
 
-    local upstream
-    local plugin_name = get_plugin_name(resource_path)
-    if plugin_name and plugin_name ~= "" then
-        local _, sub_path = config_util.parse_path(resource_path)
-        local json_path = "$." .. sub_path
-        --- the users of the API pass the jsonpath(in resourcepath) to
-        --- upstream_constructor_config which is passed to the
-        --- callback construct_upstream to create an upstream dynamically
-        local upstream_constructor_config = jp.value(res_conf.value, json_path)
-        local plugin = require("apisix.plugins." .. plugin_name)
-        upstream = plugin.construct_upstream(upstream_constructor_config)
-        upstream.resource_key = resource_path
-    else
-        upstream = res_conf.value.upstream or res_conf.value
-    end
+    local waiting_snapshot = tab_clone(waiting_pool)
+    for resource_path, resource_ver in pairs(waiting_snapshot) do
+        do
+            if find_in_working_pool(resource_path, resource_ver) then
+                core.log.info("resource: ", resource_path,
+                             " already in working pool with version: ",
+                               resource_ver)
+                goto continue
+            end
+            local res_conf = resource.fetch_latest_conf(resource_path)
+            if not res_conf then
+                goto continue
+            end
+            local upstream
+            local plugin_name = get_plugin_name(resource_path)
+            if plugin_name and plugin_name ~= "" then
+                local _, sub_path = config_util.parse_path(resource_path)
+                local json_path = "$." .. sub_path
+                --- the users of the API pass the jsonpath(in resourcepath) to
+                --- upstream_constructor_config which is passed to the
+                --- callback construct_upstream to create an upstream dynamically
+                local upstream_constructor_config = jp.value(res_conf.value, json_path)
+                local plugin = require("apisix.plugins." .. plugin_name)
+                upstream = plugin.construct_upstream(upstream_constructor_config)
+                upstream.resource_key = resource_path
+            else
+                upstream = res_conf.value.upstream or res_conf.value
+            end
+            local new_version = upstream_utils.version(res_conf.modifiedIndex,
+                                                             upstream._nodes_ver)
+            core.log.info("checking waiting pool for resource: ", resource_path,
+                    " current version: ", new_version, " requested version: ", resource_ver)
+            if resource_ver ~= new_version then
+                goto continue
+            end
 
-    return upstream
+            local existing_checker = working_pool[resource_path]
+
+            -- if a checker exists, decide between incremental update and full rebuild
+            if existing_checker and core.table.deep_eq(existing_checker.checks, upstream.checks) then
+                local new_targets = build_targets(upstream)
+                update_checker(existing_checker.checker, get_healthchecker_name(upstream),
+                               new_targets)
+                core.log.info("incrementally updated checker: ",
+                              tostring(existing_checker.checker), " for resource: ",
+                              resource_path, " and version: ", resource_ver)
+                add_working_pool(resource_path, resource_ver, existing_checker.checker,
+                                 upstream.checks)
+                goto continue
+            end
+
+            if existing_checker then
+                existing_checker.checker:delayed_clear(DELAYED_CLEAR_TIMEOUT)
+                existing_checker.checker:stop()
+                core.log.info("releasing existing checker: ", tostring(existing_checker.checker),
+                              " for resource: ", resource_path, " and version: ",
+                              existing_checker.version)
+            end
+            local checker = create_checker(upstream)
+            if not checker then
+                goto continue
+            end
+            core.log.info("create new checker: ", tostring(checker), " for resource: ",
+                        resource_path, " and version: ", resource_ver)
+            add_working_pool(resource_path, resource_ver, checker, upstream.checks)
+        end
+
+        ::continue::
+        waiting_pool[resource_path] = nil
+    end
 end
 
 
--- Reconcile a single resource's checker against the latest config. Safe to call
--- from a single timer that sweeps both the waiting and working pools.
---
--- Always reconcile against the latest known version (not the version requested
--- when the resource was queued); this avoids a race where the queued version is
--- already stale and the checker would otherwise never be (re)created.
---
--- create_checker() yields (it broadcasts target events over a cosocket), so the
--- checker is built BEFORE the old one is torn down and swapped in atomically.
--- This keeps working_pool[resource_path] pointing at a live checker across the
--- yield, so a concurrent fetch_checker() (request path) never observes a checker
--- that has already been stopped, and a failed build leaves the old one intact.
-local function reconcile_resource(resource_path)
-    local res_conf = resource.fetch_latest_conf(resource_path)
-    local upstream = resolve_upstream(resource_path, res_conf)
+local function timer_working_pool_check()
+    if core.table.nkeys(working_pool) == 0 then
+        return
+    end
 
-    local item = working_pool[resource_path]
+    local working_snapshot = tab_clone(working_pool)
+    for resource_path, item in pairs(working_snapshot) do
+        --- remove from working pool if resource doesn't exist
+        local res_conf = resource.fetch_latest_conf(resource_path)
+        local need_destroy = true
+        if res_conf and res_conf.value then
+            local upstream
+            local plugin_name = get_plugin_name(resource_path)
+            if plugin_name and plugin_name ~= "" then
+                local _, sub_path = config_util.parse_path(resource_path)
+                local json_path = "$." .. sub_path
+                --- the users of the API pass the jsonpath(in resourcepath) to
+                --- upstream_constructor_config which is passed to the
+                --- callback construct_upstream to create an upstream dynamically
+                local upstream_constructor_config = jp.value(res_conf.value, json_path)
+                local plugin = require("apisix.plugins." .. plugin_name)
+                upstream = plugin.construct_upstream(upstream_constructor_config)
+                upstream.resource_key = resource_path
+            else
+                upstream = res_conf.value.upstream or res_conf.value
+            end
+            if upstream and upstream.checks then
+                need_destroy = false
+            end
+        end
 
-    if not upstream then
-        -- resource doesn't exist anymore, destroy the checker if we have one
-        if item then
+        if need_destroy then
             working_pool[resource_path] = nil
             item.checker.dead = true
             item.checker:delayed_clear(DELAYED_CLEAR_TIMEOUT)
             item.checker:stop()
-            core.log.info("released checker: ", tostring(item.checker), " for resource: ",
+            core.log.info("try to release checker: ", tostring(item.checker), " for resource: ",
                         resource_path, " and version : ", item.version)
-        end
-        return
-    end
-
-    local new_version = upstream_utils.version(res_conf.modifiedIndex,
-                                               upstream._nodes_ver)
-    core.log.info("reconciling resource: ", resource_path,
-                " current version: ", new_version,
-                " item version: ", item and item.version or "nil")
-
-    if item and item.version == new_version then
-        return
-    end
-
-    if item and checks_config_equal(item, upstream) then
-        -- only nodes changed: reconcile targets on the live checker in place
-        item.targets_map = update_checker_targets(item.checker, upstream,
-                                                  item.targets_map)
-        item.version = new_version
-        return
-    end
-
-    -- structural change (or first creation): build new, swap, then retire old
-    local checker, targets_map = create_checker(upstream)
-    if not checker then
-        -- build failed; keep the old checker (if any) running
-        return
-    end
-    local old = item
-    add_working_pool(resource_path, new_version, checker, upstream, targets_map)
-    if old then
-        old.checker:delayed_clear(DELAYED_CLEAR_TIMEOUT)
-        old.checker:stop()
-    end
-end
-
-
--- Single reconcile timer for both pools. Running both sweeps in one timer (with
--- a single re-entry guard) means the two sweeps can never interleave on the same
--- resource across create_checker()'s yield, which would otherwise let two timers
--- each build a checker and leak the loser.
-local function timer_reconcile()
-    if core.table.nkeys(waiting_pool) > 0 then
-        local waiting_snapshot = tab_clone(waiting_pool)
-        for resource_path in pairs(waiting_snapshot) do
-            reconcile_resource(resource_path)
-            waiting_pool[resource_path] = nil
-        end
-    end
-
-    if core.table.nkeys(working_pool) > 0 then
-        local working_snapshot = tab_clone(working_pool)
-        for resource_path in pairs(working_snapshot) do
-            reconcile_resource(resource_path)
         end
     end
 end
 
 function _M.init_worker()
-    local timer_reconcile_running = false
+    local timer_create_checker_running = false
+    local timer_working_pool_check_running = false
     timer_every(1, function ()
-        if exiting() then
-            return
+        if not exiting() then
+            if timer_create_checker_running then
+                core.log.warn("timer_create_checker is already running, skipping this iteration")
+                return
+            end
+            timer_create_checker_running = true
+            local ok, err = pcall(timer_create_checker)
+            if not ok then
+                core.log.error("failed to run timer_create_checker: ", err)
+            end
+            timer_create_checker_running = false
         end
-        if timer_reconcile_running then
-            core.log.warn("timer_reconcile is already running, skipping this iteration")
-            return
+    end)
+    timer_every(1, function ()
+        if not exiting() then
+            if timer_working_pool_check_running then
+                core.log.warn("timer_working_pool_check is already running skipping iteration")
+                return
+            end
+            timer_working_pool_check_running = true
+            local ok, err = pcall(timer_working_pool_check)
+            if not ok then
+                core.log.error("failed to run timer_working_pool_check: ", err)
+            end
+            timer_working_pool_check_running = false
         end
-        timer_reconcile_running = true
-        local ok, err = pcall(timer_reconcile)
-        if not ok then
-            core.log.error("failed to run timer_reconcile: ", err)
-        end
-        timer_reconcile_running = false
     end)
 end
 
